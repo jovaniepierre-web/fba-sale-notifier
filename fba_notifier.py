@@ -46,13 +46,13 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 # Keep this comfortably larger than your schedule interval so nothing slips
 # through the cracks if a run is delayed. Duplicates are prevented by the
 # seen-orders state file regardless.
-LOOKBACK_MINUTES = int(os.environ.get("LOOKBACK_MINUTES", "60"))
+LOOKBACK_MINUTES = int(os.environ.get("LOOKBACK_MINUTES") or "60")
 
 # Where the "already notified" state is stored.
 STATE_FILE = os.environ.get("STATE_FILE", "seen_orders.json")
 
 # Only notify for FBA orders? (True = FBA only, False = FBA + merchant-fulfilled)
-FBA_ONLY = os.environ.get("FBA_ONLY", "true").strip().lower() in ("1", "true", "yes")
+FBA_ONLY = (os.environ.get("FBA_ONLY") or "true").strip().lower() in ("1", "true", "yes")
 
 # Optional label shown at the top of each notification, e.g. a store/region name.
 # Useful when running more than one store (e.g. "US" and "UK") into one chat.
