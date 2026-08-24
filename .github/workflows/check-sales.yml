@@ -1,0 +1,78 @@
+name: Check FBA sales
+
+# Runs every 5 minutes to check both stores for new sales,
+# plus a manual "Run workflow" button.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+# Allow the workflow to commit the updated state files back to the repo
+permissions:
+  contents: write
+
+# Never run two checks at once
+concurrency:
+  group: fba-sale-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ---------- US store (North America) ----------
+      - name: Check US FBA sales
+        env:
+          LWA_CLIENT_ID: ${{ secrets.LWA_CLIENT_ID }}
+          LWA_CLIENT_SECRET: ${{ secrets.LWA_CLIENT_SECRET }}
+          SP_API_REFRESH_TOKEN: ${{ secrets.SP_API_REFRESH_TOKEN_US }}
+          MARKETPLACE_ID: ATVPDKIKX0DER
+          SP_API_REGION: na
+          STORE_LABEL: "🇺🇸 US"
+          STATE_FILE: seen_orders_us.json
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FBA_ONLY: ${{ secrets.FBA_ONLY }}
+          LOOKBACK_MINUTES: ${{ secrets.LOOKBACK_MINUTES }}
+        run: python fba_notifier.py
+
+      # ---------- UK store (Europe) ----------
+      - name: Check UK FBA sales
+        if: always()   # run even if the US step errored
+        env:
+          LWA_CLIENT_ID: ${{ secrets.LWA_CLIENT_ID }}
+          LWA_CLIENT_SECRET: ${{ secrets.LWA_CLIENT_SECRET }}
+          SP_API_REFRESH_TOKEN: ${{ secrets.SP_API_REFRESH_TOKEN_UK }}
+          MARKETPLACE_ID: A1F83G8C2ARO7P
+          SP_API_REGION: eu
+          STORE_LABEL: "🇬🇧 UK"
+          STATE_FILE: seen_orders_uk.json
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FBA_ONLY: ${{ secrets.FBA_ONLY }}
+          LOOKBACK_MINUTES: ${{ secrets.LOOKBACK_MINUTES }}
+        run: python fba_notifier.py
+
+      - name: Persist "already notified" state
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain seen_orders_us.json seen_orders_uk.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add seen_orders_us.json seen_orders_uk.json
+            git commit -m "Update seen orders [skip ci]"
+            git push
+          else
+            echo "No new orders to persist."
+          fi
