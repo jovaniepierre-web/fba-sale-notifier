@@ -241,9 +241,9 @@
   },
   "2026-08-22": {
     "US": {
-      "units": 30,
-      "orders": 28,
-      "revenue": 291.27
+      "units": 32,
+      "orders": 30,
+      "revenue": 326.29
     },
     "UK": {
       "units": 26,
@@ -253,9 +253,9 @@
   },
   "2026-08-23": {
     "US": {
-      "units": 16,
-      "orders": 13,
-      "revenue": 149.8
+      "units": 24,
+      "orders": 21,
+      "revenue": 229.17
     },
     "UK": {
       "units": 7,
