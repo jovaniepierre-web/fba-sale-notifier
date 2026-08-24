@@ -46,7 +46,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 # Keep this comfortably larger than your schedule interval so nothing slips
 # through the cracks if a run is delayed. Duplicates are prevented by the
 # seen-orders state file regardless.
-LOOKBACK_MINUTES = int(os.environ.get("LOOKBACK_MINUTES") or "60")
+LOOKBACK_MINUTES = int(os.environ.get("LOOKBACK_MINUTES") or "120")
 
 # Where the "already notified" state is stored.
 STATE_FILE = os.environ.get("STATE_FILE", "seen_orders.json")
@@ -57,6 +57,11 @@ FBA_ONLY = (os.environ.get("FBA_ONLY") or "true").strip().lower() in ("1", "true
 # Optional label shown at the top of each notification, e.g. a store/region name.
 # Useful when running more than one store (e.g. "US" and "UK") into one chat.
 STORE_LABEL = os.environ.get("STORE_LABEL", "").strip()
+
+# Alert as soon as an order is placed, even while Amazon still shows it "Pending"
+# (payment not yet confirmed). Each order still only alerts once. Canceled orders
+# are never alerted.
+INCLUDE_PENDING = (os.environ.get("INCLUDE_PENDING") or "true").strip().lower() in ("1", "true", "yes")
 
 REGION_ENDPOINTS = {
     "na": "https://sellingpartnerapi-na.amazon.com",
@@ -172,12 +177,16 @@ def sp_api_get(access_token, path, params=None, max_retries=5):
 
 
 def fetch_recent_orders(access_token):
-    created_after = (
+    # Use LastUpdatedAfter (not CreatedAfter): Amazon marks new orders "Pending"
+    # first, so filtering by creation time misses them once they flip to a
+    # confirmed status outside the window. LastUpdatedAfter re-surfaces an order
+    # the moment its status changes, so confirmed sales are reliably caught.
+    updated_after = (
         datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
     params = {
         "MarketplaceIds": MARKETPLACE_ID,
-        "CreatedAfter": created_after,
+        "LastUpdatedAfter": updated_after,
     }
     orders = []
     next_token = None
@@ -236,29 +245,36 @@ def send_telegram(text):
 
 def format_notification(order, items):
     oid = order.get("AmazonOrderId", "?")
-    total = order.get("OrderTotal", {})
+    total = order.get("OrderTotal") or {}
     amount = total.get("Amount")
     currency = total.get("CurrencyCode", "")
     status = order.get("OrderStatus", "")
+    is_pending = status == "Pending"
     channel = order.get("FulfillmentChannel", "")
-    channel_label = "FBA" if channel == "AFN" else "Merchant-fulfilled" if channel == "MFN" else channel
+    channel_label = ("FBA" if channel == "AFN" else "Merchant-fulfilled"
+                     if channel == "MFN" else (channel or "TBD"))
     purchase = order.get("PurchaseDate", "")
 
     header = "\U0001F4B0 <b>New Amazon sale!</b>"
     if STORE_LABEL:
         header += f"  ({STORE_LABEL})"
     lines = [header]
+    if is_pending:
+        lines.append("⏳ <i>Pending — order placed, not yet confirmed</i>")
     if items:
         for title, sku, qty in items:
             qty_str = f"{qty}× " if qty and qty != 1 else ""
             sku_str = f" <code>{sku}</code>" if sku else ""
             lines.append(f"• {qty_str}{title}{sku_str}")
     else:
-        n_items = order.get("NumberOfItemsShipped", 0) + order.get("NumberOfItemsUnshipped", 0)
+        n_items = (order.get("NumberOfItemsShipped", 0) or 0) + \
+                  (order.get("NumberOfItemsUnshipped", 0) or 0)
         lines.append(f"• {n_items} item(s)")
 
     if amount:
         lines.append(f"\n<b>Total:</b> {amount} {currency}")
+    elif is_pending:
+        lines.append("\n<b>Total:</b> <i>pending</i>")
     lines.append(f"<b>Channel:</b> {channel_label}")
     if status:
         lines.append(f"<b>Status:</b> {status}")
@@ -278,11 +294,12 @@ def main():
         f"lookback={LOOKBACK_MINUTES}m, FBA_ONLY={FBA_ONLY})")
 
     seen = load_state()
-    first_run = seen is None
-    if first_run:
+    first_run = (seen is None) or (len(seen) == 0)
+    if seen is None:
         seen = {}
-        log("First run: no state file found. Recording current orders as a baseline "
-            "WITHOUT sending notifications (so you don't get a flood of old orders).")
+    if first_run:
+        log("Baseline run: recording current orders as a baseline WITHOUT sending "
+            "notifications (so you don't get a flood of old orders). Future runs notify new sales.")
 
     access_token = get_access_token()
     orders = fetch_recent_orders(access_token)
@@ -290,32 +307,50 @@ def main():
 
     now_iso = datetime.now(timezone.utc).isoformat()
     new_count = 0
+    stats = {"notified": 0, "pending": 0, "non_fba": 0, "already_seen": 0, "canceled": 0}
+    channels = {}
 
     for order in orders:
         oid = order.get("AmazonOrderId")
+        ch_val = order.get("FulfillmentChannel")
+        status = order.get("OrderStatus")
+        channels[f"{ch_val or 'unset'}/{status or 'unknown'}"] = \
+            channels.get(f"{ch_val or 'unset'}/{status or 'unknown'}", 0) + 1
         if not oid:
             continue
-        if FBA_ONLY and order.get("FulfillmentChannel") != "AFN":
+        # Never alert for orders that were canceled.
+        if status == "Canceled":
+            stats["canceled"] += 1
             continue
-        # Skip pending orders that have no confirmed sale yet
-        if order.get("OrderStatus") == "Pending":
+        # Only skip on fulfillment channel when we actually know it's not FBA.
+        # (Fresh "Pending" orders sometimes have no channel set yet.)
+        if FBA_ONLY and ch_val and ch_val != "AFN":
+            stats["non_fba"] += 1
+            continue
+        if status == "Pending" and not INCLUDE_PENDING:
+            stats["pending"] += 1
             continue
         if oid in seen:
+            stats["already_seen"] += 1
             continue
 
-        # New order we haven't notified about
+        # New confirmed order we haven't notified about
         seen[oid] = now_iso
         new_count += 1
-
         if first_run:
             continue  # baseline only
 
         items = fetch_order_items(access_token, oid)
         msg = format_notification(order, items)
         if send_telegram(msg):
+            stats["notified"] += 1
             log(f"Notified for order {oid}")
         time.sleep(1)  # gentle pacing between item lookups / messages
 
+    log(f"Breakdown — fetched={len(orders)} by channel/status={channels} | "
+        f"notified={stats['notified']} pending-skipped={stats['pending']} "
+        f"non-FBA-skipped={stats['non_fba']} canceled-skipped={stats['canceled']} "
+        f"already-seen={stats['already_seen']}")
     save_state(seen)
 
     if first_run:
