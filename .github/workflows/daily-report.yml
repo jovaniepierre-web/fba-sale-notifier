@@ -1,0 +1,54 @@
+name: Daily sales report
+
+# Runs once a day at 11:00 UTC (about 7 AM US Eastern), covering the previous day.
+# Also has a manual "Run workflow" button for testing.
+on:
+  schedule:
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fba-daily-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests matplotlib
+
+      - name: Build and send daily report
+        env:
+          LWA_CLIENT_ID: ${{ secrets.LWA_CLIENT_ID }}
+          LWA_CLIENT_SECRET: ${{ secrets.LWA_CLIENT_SECRET }}
+          SP_API_REFRESH_TOKEN_US: ${{ secrets.SP_API_REFRESH_TOKEN_US }}
+          SP_API_REFRESH_TOKEN_UK: ${{ secrets.SP_API_REFRESH_TOKEN_UK }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPORT_TZ: America/New_York
+        run: python daily_report.py
+
+      - name: Persist history
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain daily_history.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add daily_history.json
+            git commit -m "Update daily history [skip ci]"
+            git push
+          else
+            echo "No history change to persist."
+          fi
