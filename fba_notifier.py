@@ -214,10 +214,17 @@ def fetch_order_items(access_token, order_id):
         return []
     items = []
     for it in data.get("payload", {}).get("OrderItems", []):
+        price = it.get("ItemPrice") or {}
+        try:
+            amt = float(price.get("Amount", 0) or 0)
+        except (TypeError, ValueError):
+            amt = 0.0
         items.append((
             it.get("Title", "(unknown item)"),
             it.get("SellerSKU", ""),
             it.get("QuantityOrdered", 0),
+            amt,
+            price.get("CurrencyCode", ""),
         ))
     return items
 
@@ -255,6 +262,11 @@ def format_notification(order, items):
                      if channel == "MFN" else (channel or "TBD"))
     purchase = order.get("PurchaseDate", "")
 
+    # Sale amount from line-item prices (available even while pending). Fall back
+    # to the order total if items weren't fetched.
+    item_total = sum((it[3] for it in items), 0.0)
+    item_currency = next((it[4] for it in items if it[4]), "")
+
     header = "\U0001F4B0 <b>New Amazon sale!</b>"
     if STORE_LABEL:
         header += f"  ({STORE_LABEL})"
@@ -262,7 +274,7 @@ def format_notification(order, items):
     if is_pending:
         lines.append("⏳ <i>Pending — order placed, not yet confirmed</i>")
     if items:
-        for title, sku, qty in items:
+        for title, sku, qty, _amt, _cur in items:
             qty_str = f"{qty}× " if qty and qty != 1 else ""
             sku_str = f" <code>{sku}</code>" if sku else ""
             lines.append(f"• {qty_str}{title}{sku_str}")
@@ -271,10 +283,12 @@ def format_notification(order, items):
                   (order.get("NumberOfItemsUnshipped", 0) or 0)
         lines.append(f"• {n_items} item(s)")
 
-    if amount:
-        lines.append(f"\n<b>Total:</b> {amount} {currency}")
+    if item_total > 0:
+        lines.append(f"\n<b>Sale:</b> {item_total:,.2f} {item_currency or currency}")
+    elif amount:
+        lines.append(f"\n<b>Sale:</b> {amount} {currency}")
     elif is_pending:
-        lines.append("\n<b>Total:</b> <i>pending</i>")
+        lines.append("\n<b>Sale:</b> <i>pending</i>")
     lines.append(f"<b>Channel:</b> {channel_label}")
     if status:
         lines.append(f"<b>Status:</b> {status}")
