@@ -58,12 +58,12 @@ FBA_ONLY = (os.environ.get("FBA_ONLY") or "true").strip().lower() in ("1", "true
 # Useful when running more than one store (e.g. "US" and "UK") into one chat.
 STORE_LABEL = os.environ.get("STORE_LABEL", "").strip()
 
-# Whether to alert while an order is still "Pending". Amazon withholds the price
-# on Pending orders, so we default to FALSE: wait until the order clears Pending
-# (usually minutes) and alert then, so the sale amount is included. Each order
-# still alerts only once; canceled orders are never alerted. Set to "true" to
-# alert instantly at the pending stage instead (without an amount).
-INCLUDE_PENDING = (os.environ.get("INCLUDE_PENDING") or "false").strip().lower() in ("1", "true", "yes")
+# Alert as soon as an order is placed, including while it's still "Pending".
+# (These orders can sit in Pending for a long time awaiting payment verification,
+# so waiting for confirmation would delay alerts too much.) The sale amount is
+# shown whenever Amazon's API returns item pricing; otherwise it's omitted.
+# Each order alerts only once; canceled orders are never alerted.
+INCLUDE_PENDING = (os.environ.get("INCLUDE_PENDING") or "true").strip().lower() in ("1", "true", "yes")
 
 REGION_ENDPOINTS = {
     "na": "https://sellingpartnerapi-na.amazon.com",
@@ -357,6 +357,9 @@ def main():
             continue  # baseline only
 
         items = fetch_order_items(access_token, oid)
+        # Diagnostic: does the API give us a price for this order (esp. pending)?
+        amt = sum((it[3] for it in items), 0.0)
+        log(f"Order {oid} status={status} items={len(items)} item_total={amt:.2f}")
         msg = format_notification(order, items)
         if send_telegram(msg):
             stats["notified"] += 1
