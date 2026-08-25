@@ -36,6 +36,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 REPORT_TZ = os.environ.get("REPORT_TZ", "America/New_York").strip()
 HISTORY_FILE = os.environ.get("HISTORY_FILE", "daily_history.json")
 TREND_DAYS = int(os.environ.get("TREND_DAYS") or "21")
+SKU_TREND_DAYS = int(os.environ.get("SKU_TREND_DAYS") or "14")
 
 STORES = [
     {"key": "US", "label": "\U0001F1FA\U0001F1F8 US", "region": "na",
@@ -129,7 +130,9 @@ def blank_day():
 def aggregate_into(history, store, orders, tz):
     for o in orders:
         status = o.get("OrderStatus", "")
-        if status in ("Canceled", "Pending"):
+        # Count "ordered" (include Pending) to match Amazon's Sales dashboard and
+        # the alerts; only genuinely canceled orders are dropped.
+        if status == "Canceled":
             continue
         pd = o.get("PurchaseDate")
         if not pd:
@@ -144,6 +147,91 @@ def aggregate_into(history, store, orders, tz):
             bucket["revenue"] += float(total.get("Amount", 0) or 0)
         except (TypeError, ValueError):
             pass
+
+
+def fetch_order_items(store, access_token, order_id):
+    """Return [(sku, title, qty), ...] for an order's line items."""
+    try:
+        data = sp_get(store["region"], access_token,
+                      f"/orders/v0/orders/{order_id}/orderItems", {})
+    except Exception as e:
+        log(f"WARNING: order items for {order_id}: {e}")
+        return []
+    out = []
+    for it in data.get("payload", {}).get("OrderItems", []):
+        out.append((it.get("SellerSKU", "(no SKU)"),
+                    it.get("Title", ""),
+                    int(it.get("QuantityOrdered", 0) or 0)))
+    return out
+
+
+def update_sku_history(store, access_token, orders, tz, days_needed, history):
+    """For each day in days_needed, fetch order-item SKUs for that day's confirmed
+    orders and store per-SKU unit counts in history[day]['skus'][sku] = {title, US, UK}.
+    Only days present in `orders` can be filled (the fetch window)."""
+    from collections import defaultdict
+    by_day = defaultdict(list)
+    for o in orders:
+        if o.get("OrderStatus") == "Canceled":  # include Pending; drop only canceled
+            continue
+        pd = o.get("PurchaseDate")
+        oid = o.get("AmazonOrderId")
+        if not pd or not oid:
+            continue
+        d = local_day(pd, tz)
+        if d in days_needed:
+            by_day[d].append(oid)
+    for d, oids in by_day.items():
+        skus = history.setdefault(d, blank_day()).setdefault("skus", {})
+        for oid in oids:
+            for sku, title, qty in fetch_order_items(store, access_token, oid):
+                rec = skus.setdefault(sku, {"title": title, "US": 0, "UK": 0})
+                rec[store["key"]] = rec.get(store["key"], 0) + qty
+                if title and not rec.get("title"):
+                    rec["title"] = title
+            time.sleep(2.0)  # stay under the getOrderItems steady rate limit
+    if by_day:
+        log(f"{store['key']}: fetched SKU items for {len(by_day)} day(s): {sorted(by_day)}")
+
+
+def sku_rows_sorted(skus):
+    """SKUs sorted by total units desc: [(sku, rec, total), ...]."""
+    rows = [(sku, rec, rec.get("US", 0) + rec.get("UK", 0)) for sku, rec in skus.items()]
+    rows.sort(key=lambda r: -r[2])
+    return rows
+
+
+_BARS = "▁▂▃▄▅▆▇█"
+def sparkline(vals):
+    if not vals or max(vals) == 0:
+        return "▁" * len(vals)
+    mx = max(vals)
+    return "".join(_BARS[min(len(_BARS) - 1, int(v / mx * (len(_BARS) - 1)))] for v in vals)
+
+
+def sku_window_series(history, target_date):
+    """Return (day_labels, {sku: {title, US, UK, total, daily:[...]}}) over the
+    last SKU_TREND_DAYS days, from the per-day SKU tallies stored in history."""
+    days = [d.strftime("%Y-%m-%d") for d in date_range(target_date, SKU_TREND_DAYS)]
+    skus = {}
+    for i, d in enumerate(days):
+        for sku, rec in history.get(d, {}).get("skus", {}).items():
+            s = skus.setdefault(sku, {"title": rec.get("title", ""), "US": 0, "UK": 0,
+                                      "daily": [0] * len(days)})
+            us = rec.get("US", 0)
+            uk = rec.get("UK", 0)
+            s["daily"][i] += us + uk
+            s["US"] += us
+            s["UK"] += uk
+            if rec.get("title") and not s["title"]:
+                s["title"] = rec["title"]
+    for s in skus.values():
+        s["total"] = s["US"] + s["UK"]
+    return days, skus
+
+
+def esc(txt):
+    return (str(txt).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
 def date_range(end_date, days):
@@ -168,6 +256,33 @@ def moving_avg(values, window=7):
         seg = values[lo:i + 1]
         out.append(sum(seg) / len(seg) if seg else 0)
     return out
+
+
+def make_sku_trend_png(days, skus, topn=6):
+    """Line chart: daily units (US+UK) for the top-N SKUs over the window."""
+    top = sorted(skus.items(), key=lambda kv: -kv[1]["total"])[:topn]
+    fig, ax = plt.subplots(figsize=(8.2, 4.0), dpi=130)
+    x = range(len(days))
+    if top:
+        for sku, s in top:
+            ax.plot(x, s["daily"], marker="o", ms=2.5, lw=1.7, label=sku)
+        step = max(1, len(days) // 10)
+        ax.set_xticks(list(x)[::step])
+        ax.set_xticklabels([d[5:] for d in days][::step])
+        ax.legend(fontsize=7, frameon=False, ncol=2)
+    else:
+        ax.text(0.5, 0.5, "Per-SKU trend builds up over the next couple of weeks",
+                ha="center", va="center", color="#8b8d98", transform=ax.transAxes)
+        ax.set_xticks([]); ax.set_yticks([])
+    ax.set_title(f"Top SKUs — units per day (last {len(days)} days)",
+                 loc="left", fontweight="bold")
+    ax.grid(True, color="#ececf0", lw=0.8)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
 
 
 def make_chart_png(history, target_date):
@@ -277,7 +392,7 @@ def compute_summary(history, target_date):
     }
 
 
-def build_summary_text(s):
+def build_summary_text(s, sku_data):
     lines = [f"\U0001F4CA <b>Daily sales report</b> — {s['date']}", ""]
     lines.append(f"<b>{s['units']}</b> units · <b>{s['orders']}</b> orders")
     lines.append(f"vs prior day: units {arrow(s['units_dod'])}, orders {arrow(s['orders_dod'])}")
@@ -287,11 +402,43 @@ def build_summary_text(s):
         ps = s["per_store"][key]
         lines.append(f"{ps['label']}: {money(ps['symbol'], ps['revenue'])} "
                      f"· {ps['orders']} orders · AOV {money(ps['symbol'], ps['aov'])}")
+    top = sku_rows_sorted(sku_data)[:5]
+    if top:
+        lines.append("\n<b>Top SKUs (units US/UK):</b>")
+        for sku, rec, total in top:
+            lines.append(f"• <code>{esc(sku)}</code> — {total} ({rec.get('US',0)}/{rec.get('UK',0)})")
+    lines.append("\n<i>Full per-SKU breakdown in the attached dashboard.</i>")
     return "\n".join(lines)
 
 
 def build_html(history, target_date, summary, chart_png):
     chart_b64 = base64.b64encode(chart_png).decode()
+    sku_data = history.get(target_date.strftime("%Y-%m-%d"), {}).get("skus", {})
+
+    # --- yesterday's per-SKU table ---
+    sku_rows = ""
+    for sku, rec, total in sku_rows_sorted(sku_data):
+        sku_rows += (f"<tr><td><code>{esc(sku)}</code></td>"
+                     f"<td class='prod'>{esc(rec.get('title') or '')}</td>"
+                     f"<td>{rec.get('US', 0)}</td><td>{rec.get('UK', 0)}</td>"
+                     f"<td><b>{total}</b></td></tr>")
+    if not sku_rows:
+        sku_rows = "<tr><td colspan='5' style='color:var(--mut)'>No confirmed unit sales for this day.</td></tr>"
+
+    # --- 14-day per-SKU/per-country trend ---
+    sku_days, sku_series = sku_window_series(history, target_date)
+    sku_trend_b64 = base64.b64encode(make_sku_trend_png(sku_days, sku_series)).decode()
+    trend_rows = ""
+    for sku, rec, total in sku_rows_sorted(sku_series):
+        trend_rows += (f"<tr><td><code>{esc(sku)}</code></td>"
+                       f"<td class='prod'>{esc(rec.get('title') or '')}</td>"
+                       f"<td class='spark'>{sparkline(rec['daily'])}</td>"
+                       f"<td>{rec['US']}</td><td>{rec['UK']}</td>"
+                       f"<td><b>{total}</b></td></tr>")
+    if not trend_rows:
+        trend_rows = ("<tr><td colspan='6' style='color:var(--mut)'>Per-SKU history is still "
+                      "building — it fills in over the next couple of weeks.</td></tr>")
+
     days = date_range(target_date, min(TREND_DAYS, 14))
     rows = ""
     for d in reversed(days):
@@ -335,11 +482,21 @@ table{{width:100%;border-collapse:collapse;margin-top:22px;font-size:14px}}
 th,td{{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}}
 th{{color:var(--mut);font-weight:600}}td:not(:first-child){{text-align:right}}
 h2{{font-size:15px;margin:26px 0 6px}}
+td.prod{{max-width:320px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+td.spark{{font-family:monospace;letter-spacing:1px;color:var(--accent);text-align:left}}
+code{{font-size:12px}}
 </style></head><body><div class='wrap'>
 <h1>RevHeads — Daily Sales Report</h1>
 <div class='date'>{summary['date']} · US + UK</div>
 <div class='cards'>{cards}</div>
 <img src='data:image/png;base64,{chart_b64}' alt='trend charts'>
+<h2>Units sold by SKU · {summary['date']}</h2>
+<table><thead><tr><th>SKU</th><th>Product</th><th>US</th><th>UK</th><th>Total</th></tr></thead>
+<tbody>{sku_rows}</tbody></table>
+<h2>Per-SKU trend · last {SKU_TREND_DAYS} days</h2>
+<img src='data:image/png;base64,{sku_trend_b64}' alt='per-SKU trend'>
+<table><thead><tr><th>SKU</th><th>Product</th><th>Trend</th><th>US {SKU_TREND_DAYS}d</th><th>UK {SKU_TREND_DAYS}d</th><th>Total</th></tr></thead>
+<tbody>{trend_rows}</tbody></table>
 <h2>Last {min(TREND_DAYS,14)} days</h2>
 <table><thead><tr><th>Date</th><th>Units</th><th>Orders</th><th>US rev</th><th>UK rev</th></tr></thead>
 <tbody>{rows}</tbody></table>
@@ -418,6 +575,12 @@ def main():
         d = (fetch_from + timedelta(days=i)).strftime("%Y-%m-%d")
         history[d] = blank_day()
 
+    # Which days still need per-SKU item lookups (full backfill on first run,
+    # just the recomputed recent days thereafter).
+    sku_window_days = [(target_date - timedelta(days=i)).strftime("%Y-%m-%d")
+                       for i in range(SKU_TREND_DAYS)]
+    sku_days_needed = {d for d in sku_window_days if "skus" not in history.get(d, {})}
+
     for store in STORES:
         if not store["refresh_token"]:
             log(f"Skipping {store['key']}: no refresh token set.")
@@ -427,14 +590,28 @@ def main():
             orders = fetch_orders_since(store, token, created_after)
             aggregate_into(history, store, orders, tz)
             log(f"{store['key']}: fetched {len(orders)} orders since {created_after}")
+            update_sku_history(store, token, orders, tz, sku_days_needed, history)
         except Exception as e:
             log(f"ERROR for {store['key']}: {e}")
 
+    # For the days we freshly pulled line items, use the summed ordered
+    # quantities as the unit count — accurate even for pending orders (whose
+    # order-level shipped/unshipped counts are often 0).
+    for d in sku_days_needed:
+        entry = history.get(d)
+        if not entry:
+            continue
+        skus = entry.get("skus", {})
+        for s in STORES:
+            units = sum(rec.get(s["key"], 0) for rec in skus.values())
+            entry.setdefault(s["key"], {"units": 0, "orders": 0, "revenue": 0.0})["units"] = units
+
     save_history(history, target_date)
 
+    sku_today = history.get(target_date.strftime("%Y-%m-%d"), {}).get("skus", {})
     summary = compute_summary(history, target_date)
     chart = make_chart_png(history, target_date)
-    text = build_summary_text(summary)
+    text = build_summary_text(summary, sku_today)
     html = build_html(history, target_date, summary, chart)
 
     tg_send_photo(chart, text)
