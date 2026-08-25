@@ -159,9 +159,15 @@ def fetch_order_items(store, access_token, order_id):
         return []
     out = []
     for it in data.get("payload", {}).get("OrderItems", []):
+        price = it.get("ItemPrice") or {}
+        try:
+            amt = float(price.get("Amount", 0) or 0)   # line total (price × qty), pre-tax
+        except (TypeError, ValueError):
+            amt = 0.0
         out.append((it.get("SellerSKU", "(no SKU)"),
                     it.get("Title", ""),
-                    int(it.get("QuantityOrdered", 0) or 0)))
+                    int(it.get("QuantityOrdered", 0) or 0),
+                    amt))
     return out
 
 
@@ -182,14 +188,20 @@ def update_sku_history(store, access_token, orders, tz, days_needed, history):
         if d in days_needed:
             by_day[d].append(oid)
     for d, oids in by_day.items():
-        skus = history.setdefault(d, blank_day()).setdefault("skus", {})
+        entry = history.setdefault(d, blank_day())
+        skus = entry.setdefault("skus", {})
+        rev = 0.0
         for oid in oids:
-            for sku, title, qty in fetch_order_items(store, access_token, oid):
+            for sku, title, qty, price in fetch_order_items(store, access_token, oid):
                 rec = skus.setdefault(sku, {"title": title, "US": 0, "UK": 0})
                 rec[store["key"]] = rec.get(store["key"], 0) + qty
                 if title and not rec.get("title"):
                     rec["title"] = title
+                rev += price
             time.sleep(2.0)  # stay under the getOrderItems steady rate limit
+        # Revenue from line items (filled in even for pending orders, and pre-tax
+        # like Amazon's "ordered product sales") overrides the order-total figure.
+        entry.setdefault(store["key"], {"units": 0, "orders": 0, "revenue": 0.0})["revenue"] = round(rev, 2)
     if by_day:
         log(f"{store['key']}: fetched SKU items for {len(by_day)} day(s): {sorted(by_day)}")
 
@@ -575,11 +587,13 @@ def main():
         d = (fetch_from + timedelta(days=i)).strftime("%Y-%m-%d")
         history[d] = blank_day()
 
-    # Which days still need per-SKU item lookups (full backfill on first run,
-    # just the recomputed recent days thereafter).
-    sku_window_days = [(target_date - timedelta(days=i)).strftime("%Y-%m-%d")
-                       for i in range(SKU_TREND_DAYS)]
-    sku_days_needed = {d for d in sku_window_days if "skus" not in history.get(d, {})}
+    # Which days still need per-SKU item lookups. We fetch items across the whole
+    # trend window (not just the SKU-trend window) so units AND revenue come from
+    # line items consistently for every day on the charts. Full backfill on first
+    # run, just the recomputed recent days thereafter.
+    item_window_days = [(target_date - timedelta(days=i)).strftime("%Y-%m-%d")
+                        for i in range(TREND_DAYS)]
+    sku_days_needed = {d for d in item_window_days if "skus" not in history.get(d, {})}
 
     for store in STORES:
         if not store["refresh_token"]:
