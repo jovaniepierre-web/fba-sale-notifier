@@ -58,10 +58,12 @@ FBA_ONLY = (os.environ.get("FBA_ONLY") or "true").strip().lower() in ("1", "true
 # Useful when running more than one store (e.g. "US" and "UK") into one chat.
 STORE_LABEL = os.environ.get("STORE_LABEL", "").strip()
 
-# Alert as soon as an order is placed, even while Amazon still shows it "Pending"
-# (payment not yet confirmed). Each order still only alerts once. Canceled orders
-# are never alerted.
-INCLUDE_PENDING = (os.environ.get("INCLUDE_PENDING") or "true").strip().lower() in ("1", "true", "yes")
+# Whether to alert while an order is still "Pending". Amazon withholds the price
+# on Pending orders, so we default to FALSE: wait until the order clears Pending
+# (usually minutes) and alert then, so the sale amount is included. Each order
+# still alerts only once; canceled orders are never alerted. Set to "true" to
+# alert instantly at the pending stage instead (without an amount).
+INCLUDE_PENDING = (os.environ.get("INCLUDE_PENDING") or "false").strip().lower() in ("1", "true", "yes")
 
 REGION_ENDPOINTS = {
     "na": "https://sellingpartnerapi-na.amazon.com",
